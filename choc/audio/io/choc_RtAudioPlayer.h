@@ -36,9 +36,15 @@
 
 #define INCLUDED_VIA_CHOC_RTAUDIO 1
 #include "../../platform/choc_DisableAllWarnings.h"
+// Keep UNICODE and _UNICODE in lockstep: RtMidi's ConvertToUTF8() takes a
+// TCHAR* (keyed off _UNICODE) while MIDIINCAPS.szPname is CHAR/WCHAR (keyed off
+// UNICODE). Toggling only UNICODE leaves them mismatched and RtMidi.cpp fails to
+// compile under Unicode builds (MSVC C2664).
 #define UNICODE
+#define _UNICODE
 #include "rtaudio/RtAudio.cpp"
 #undef UNICODE
+#undef _UNICODE
 #include "rtaudio/RtMidi.cpp"
 #include "../../platform/choc_ReenableAllWarnings.h"
 #undef INCLUDED_VIA_CHOC_RTAUDIO
