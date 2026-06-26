@@ -31,7 +31,11 @@
  #define __WINDOWS_MM__ 1
 #elif CHOC_LINUX
  #define __LINUX_ALSA__
- #define __UNIX_JACK__ 1
+ // JACK is on by default (choc's behaviour). Define CHOC_DISABLE_JACK to drop it
+ // and avoid the libjack build/runtime dependency (ALSA still available).
+ #if ! CHOC_DISABLE_JACK
+  #define __UNIX_JACK__ 1
+ #endif
 #endif
 
 #define INCLUDED_VIA_CHOC_RTAUDIO 1
