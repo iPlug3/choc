@@ -150,6 +150,13 @@ void setWindowsDPIAwareness();
 
 #if CHOC_LINUX
 
+// This header uses GTK directly but, unlike choc_MessageLoop.h / choc_WebView.h,
+// did not include it - so it only compiled if the includer happened to pull in
+// <gtk/gtk.h> first. Include it here so the header is self-contained.
+#include "../platform/choc_DisableAllWarnings.h"
+#include <gtk/gtk.h>
+#include "../platform/choc_ReenableAllWarnings.h"
+
 struct choc::ui::DesktopWindow::Pimpl
 {
     Pimpl (DesktopWindow& w, Bounds bounds)  : owner (w)
