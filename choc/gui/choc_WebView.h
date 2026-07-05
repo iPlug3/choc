@@ -137,6 +137,14 @@ public:
         /// otherwise wouldn't work by default. This lets you turn that off if you
         /// need to.
         bool enableDefaultClipboardKeyShortcutsInSafari = true;
+
+        /// When true, the webview denies the browser permission requests that
+        /// would otherwise show the user a prompt (e.g. Web MIDI, microphone,
+        /// camera, geolocation). Clipboard read is left allowed — it never
+        /// prompts and web apps rely on it for paste. Useful for self-contained
+        /// UIs (such as plugin editors) that must not pop a system permission
+        /// prompt. Currently honoured by the Windows (WebView2) backend.
+        bool denyPermissionRequests = false;
     };
 
     /// Creates a WebView with default options.
@@ -1736,8 +1744,15 @@ private:
             COREWEBVIEW2_PERMISSION_KIND permissionKind;
             args->get_PermissionKind (std::addressof (permissionKind));
 
+            // Setting a non-DEFAULT state suppresses WebView2's permission prompt.
+            // Clipboard read is auto-allowed (it never prompts and web apps rely
+            // on it for paste), so allow it even when denyPermissionRequests is
+            // set; that flag targets the prompt-triggering device permissions
+            // (Web MIDI, microphone, camera, geolocation, …).
             if (permissionKind == COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ)
                 args->put_State (COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+            else if (ownerPimpl.options.denyPermissionRequests)
+                args->put_State (COREWEBVIEW2_PERMISSION_STATE_DENY);
 
             return S_OK;
         }
