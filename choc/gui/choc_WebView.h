@@ -137,6 +137,37 @@ public:
         /// otherwise wouldn't work by default. This lets you turn that off if you
         /// need to.
         bool enableDefaultClipboardKeyShortcutsInSafari = true;
+
+        /// Describes a download which the page has started, e.g. by clicking a link
+        /// with a `download` attribute, or navigating to a resource the browser can't
+        /// display itself.
+        struct DownloadRequest
+        {
+            /// The source of the data. This may be a `blob:` URL, in which case it
+            /// isn't much use for anything other than logging.
+            std::string url;
+
+            /// The name the page would like the file to be given. This comes from the
+            /// link's `download` attribute or the `Content-Disposition` header, and
+            /// may be empty.
+            std::string suggestedFilename;
+
+            /// The MIME type of the data, which may be empty.
+            std::string mimeType;
+        };
+
+        /// Called when the page starts a download, to decide where it should be saved.
+        /// Return the full local path of the file to write, or an empty string to
+        /// cancel the download.
+        /// If this isn't set, the platform's native save dialog is shown, seeded with
+        /// the suggested filename.
+        /// (Currently honoured by the macOS and Windows backends)
+        std::function<std::string(const DownloadRequest&)> chooseDownloadDestination;
+
+        /// Called when a download finishes, with the path that was written and whether
+        /// it succeeded. This isn't called for downloads which were cancelled.
+        /// (Currently honoured by the macOS and Windows backends)
+        std::function<void(const std::string& localPath, bool succeeded)> onDownloadCompleted;
     };
 
     /// Creates a WebView with default options.
@@ -244,6 +275,10 @@ inline std::unique_ptr<juce::Component> createJUCEWebViewHolder (choc::ui::WebVi
 
 struct choc::ui::WebView::Pimpl
 {
+    // NB: Options::chooseDownloadDestination and Options::onDownloadCompleted are not
+    // implemented on this backend yet - it would need WebKitWebContext's "download-started"
+    // signal and WebKitDownload's "decide-destination". Downloads keep WebKitGTK's default
+    // behaviour for now.
     Pimpl (WebView& v, const Options& opts)
         : owner (v), options (opts), fetchResource (options.fetchResource)
     {
@@ -830,12 +865,125 @@ private:
         return (CHOC_OBJC_CAST_BRIDGED Pimpl*) (objc_getAssociatedObject (self, "choc_webview"));
     }
 
+    /// WKDownload and the download navigation policies arrived in macOS 11.3 / iOS 14.5,
+    /// so on older systems we have to leave downloads doing whatever they did before.
+    static bool canPerformDownloads()
+    {
+        return objc_getClass ("WKDownload") != nullptr;
+    }
+
+    /// Called by the WKDownloadDelegate method to find out where a download should go.
+    /// The completion handler must be invoked exactly once - with nil to cancel.
+    void chooseDownloadDestination (id download, id response, id suggestedFilename, void (^completionHandler)(id))
+    {
+        CHOC_AUTORELEASE_BEGIN
+
+        Options::DownloadRequest request;
+        request.suggestedFilename = objc::getString (suggestedFilename);
+
+        if (response != nullptr)
+        {
+            request.mimeType = objc::getString (objc::call<id> (response, "MIMEType"));
+
+            if (id url = objc::call<id> (response, "URL"))
+                request.url = objc::getString (objc::call<id> (url, "absoluteString"));
+        }
+
+        if (options->chooseDownloadDestination)
+        {
+            applyDownloadDestination (download, options->chooseDownloadDestination (request), completionHandler);
+            return;
+        }
+
+        id panel = objc::callClass<id> ("NSSavePanel", "savePanel");
+
+        if (! request.suggestedFilename.empty())
+            objc::call<void> (panel, "setNameFieldStringValue:", objc::getNSString (request.suggestedFilename));
+
+        // If the webview hasn't been added to a window yet then there's nothing to hang a
+        // sheet from, so fall back to an application-modal dialog.
+        id window = objc::call<id> (webview, "window");
+
+        if (window == nullptr)
+        {
+            applyDownloadDestination (download, getPanelResult (panel, objc::call<long> (panel, "runModal")), completionHandler);
+            return;
+        }
+
+        auto checker = deletionChecker;
+
+        objc::call<void> (panel, "beginSheetModalForWindow:completionHandler:", window,
+                          ^(long result)
+                          {
+                              CHOC_AUTORELEASE_BEGIN
+
+                              if (checker->deleted)
+                                  completionHandler (nil);
+                              else
+                                  applyDownloadDestination (download, getPanelResult (panel, result), completionHandler);
+
+                              CHOC_AUTORELEASE_END
+                          });
+
+        CHOC_AUTORELEASE_END
+    }
+
+    static std::string getPanelResult (id panel, long modalResponse)
+    {
+        static constexpr long NSModalResponseOK = 1;
+
+        if (modalResponse == NSModalResponseOK)
+            if (id url = objc::call<id> (panel, "URL"))
+                return objc::getString (objc::call<id> (url, "path"));
+
+        return {};
+    }
+
+    /// An empty path means the user cancelled, which we pass on to WebKit as a nil URL.
+    void applyDownloadDestination (id download, const std::string& path, void (^completionHandler)(id))
+    {
+        if (path.empty())
+        {
+            downloadDestinations.erase (download);
+            completionHandler (nil);
+            return;
+        }
+
+        // WebKit abandons a download (silently - not even a failure callback) if something
+        // already exists at the destination, so it has to be cleared out of the way first.
+        // Replacing is what the caller asked for: either the save panel has already got the
+        // user's agreement to replace the file, or chooseDownloadDestination named it.
+        objc::call<BOOL> (objc::callClass<id> ("NSFileManager", "defaultManager"),
+                          "removeItemAtPath:error:", objc::getNSString (path), (id) nullptr);
+
+        downloadDestinations[download] = path;
+        completionHandler (objc::callClass<id> ("NSURL", "fileURLWithPath:", objc::getNSString (path)));
+    }
+
+    void handleDownloadFinished (id download, bool succeeded)
+    {
+        auto i = downloadDestinations.find (download);
+
+        if (i == downloadDestinations.end())
+            return;
+
+        auto path = i->second;
+        downloadDestinations.erase (i);
+
+        if (options->onDownloadCompleted)
+            options->onDownloadCompleted (path, succeeded);
+    }
+
     WebView& owner;
     // NB: this is a pointer because making it a member forces the alignment of this Pimpl class
     // to 16, which then conflicts with obj-C pointer alignment...
     std::unique_ptr<Options> options;
     id webview = {}, manager = {}, delegate = {};
     std::string defaultURI;
+
+    // The destination chosen for each in-flight WKDownload. Keeping these per-download
+    // rather than in a single variable means concurrent downloads can't clobber each other.
+    std::unordered_map<id, std::string> downloadDestinations;
 
     struct WebviewClass
     {
@@ -941,6 +1089,74 @@ private:
                                 CHOC_AUTORELEASE_END
                              }), "v@:@@@@");
 
+            //==============================================================================
+            // Downloads. A link with a `download` attribute sets shouldPerformDownload on the
+            // navigation action, and a response whose MIME type the browser can't display can
+            // also be turned into a download. In both cases WebKit needs the policy to say so,
+            // and then needs a WKDownloadDelegate, or the download is silently dropped.
+            //
+            // NB: these two policy methods are now the only ones WebKit will consult, so every
+            // path through them must call the decision handler exactly once, and everything
+            // that isn't a download has to be allowed through.
+
+            class_addMethod (delegateClass, sel_registerName ("webView:decidePolicyForNavigationAction:decisionHandler:"),
+                             (IMP) (+[](id, SEL, id, id action, void (^decisionHandler)(long))
+                             {
+                                 if (canPerformDownloads()
+                                       && objc::call<BOOL> (action, "respondsToSelector:", sel_registerName ("shouldPerformDownload"))
+                                       && objc::call<BOOL> (action, "shouldPerformDownload"))
+                                     decisionHandler (WKNavigationActionPolicyDownload);
+                                 else
+                                     decisionHandler (WKNavigationActionPolicyAllow);
+                             }), "v@:@@@");
+
+            // NB: WebKit can't turn a response served by a WKURLSchemeHandler into a WKDownload,
+            // so when fetchResource is being used, this path never produces a download. Links with
+            // a `download` attribute (including blob: URLs) still work, via the method above.
+            class_addMethod (delegateClass, sel_registerName ("webView:decidePolicyForNavigationResponse:decisionHandler:"),
+                             (IMP) (+[](id, SEL, id, id response, void (^decisionHandler)(long))
+                             {
+                                 if (canPerformDownloads() && ! objc::call<BOOL> (response, "canShowMIMEType"))
+                                     decisionHandler (WKNavigationResponsePolicyDownload);
+                                 else
+                                     decisionHandler (WKNavigationResponsePolicyAllow);
+                             }), "v@:@@@");
+
+            class_addMethod (delegateClass, sel_registerName ("webView:navigationAction:didBecomeDownload:"),
+                             (IMP) (+[](id self, SEL, id, id, id download)
+                             {
+                                 objc::call<void> (download, "setDelegate:", self);
+                             }), "v@:@@@");
+
+            class_addMethod (delegateClass, sel_registerName ("webView:navigationResponse:didBecomeDownload:"),
+                             (IMP) (+[](id self, SEL, id, id, id download)
+                             {
+                                 objc::call<void> (download, "setDelegate:", self);
+                             }), "v@:@@@");
+
+            class_addMethod (delegateClass, sel_registerName ("download:decideDestinationUsingResponse:suggestedFilename:completionHandler:"),
+                             (IMP) (+[](id self, SEL, id download, id response, id filename, void (^completionHandler)(id))
+                             {
+                                 if (auto p = getPimpl (self))
+                                     p->chooseDownloadDestination (download, response, filename, completionHandler);
+                                 else
+                                     completionHandler (nil);
+                             }), "v@:@@@@");
+
+            class_addMethod (delegateClass, sel_registerName ("downloadDidFinish:"),
+                             (IMP) (+[](id self, SEL, id download)
+                             {
+                                 if (auto p = getPimpl (self))
+                                     p->handleDownloadFinished (download, true);
+                             }), "v@:@");
+
+            class_addMethod (delegateClass, sel_registerName ("download:didFailWithError:resumeData:"),
+                             (IMP) (+[](id self, SEL, id download, id, id)
+                             {
+                                 if (auto p = getPimpl (self))
+                                     p->handleDownloadFinished (download, false);
+                             }), "v@:@@@");
+
             objc_registerClassPair (delegateClass);
         }
 
@@ -953,6 +1169,11 @@ private:
     };
 
     static constexpr long WKUserScriptInjectionTimeAtDocumentStart = 0;
+
+    static constexpr long WKNavigationActionPolicyAllow = 1,
+                          WKNavigationActionPolicyDownload = 2,
+                          WKNavigationResponsePolicyAllow = 1,
+                          WKNavigationResponsePolicyDownload = 2;
 };
 
 //==============================================================================
@@ -991,6 +1212,7 @@ private:
 
 #include <atomic>
 #include <shlobj.h>
+#include <shobjidl.h>   // for IFileSaveDialog, used as the default download destination chooser
 #include <rpc.h>
 #include <rpcndr.h>
 #include <objidl.h>
@@ -1225,6 +1447,110 @@ public:
     virtual HRESULT STDMETHODCALLTYPE RemoveWebResourceRequestedFilter(const LPCWSTR, const COREWEBVIEW2_WEB_RESOURCE_CONTEXT) = 0;
     virtual HRESULT STDMETHODCALLTYPE add_WindowCloseRequested(void*, EventRegistrationToken*) = 0;
     virtual HRESULT STDMETHODCALLTYPE remove_WindowCloseRequested(EventRegistrationToken) = 0;
+};
+
+//==============================================================================
+// Downloads. add_DownloadStarting lives on ICoreWebView2_4, so the two intermediate
+// interfaces have to be spelled out to get its vtable layout right - the methods we
+// don't use still need to be declared, in the SDK's order, or every call lands on the
+// wrong slot. Unused parameter types are declared as void*, as elsewhere in this file.
+
+enum COREWEBVIEW2_DOWNLOAD_STATE
+{
+    COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS = 0,
+    COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED = 1,
+    COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED = 2
+};
+
+struct ICoreWebView2DownloadOperation;
+
+MIDL_INTERFACE("81336594-7ede-4ba9-bf71-acf0a95b58dd")
+ICoreWebView2StateChangedEventHandler : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2DownloadOperation*, IUnknown*) = 0;
+};
+
+MIDL_INTERFACE("3d6b6cf2-afe1-44c7-a995-c65117714336")
+ICoreWebView2DownloadOperation : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE add_BytesReceivedChanged(void*, EventRegistrationToken*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_BytesReceivedChanged(EventRegistrationToken) = 0;
+    virtual HRESULT STDMETHODCALLTYPE add_EstimatedEndTimeChanged(void*, EventRegistrationToken*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_EstimatedEndTimeChanged(EventRegistrationToken) = 0;
+    virtual HRESULT STDMETHODCALLTYPE add_StateChanged(ICoreWebView2StateChangedEventHandler*, EventRegistrationToken*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_StateChanged(EventRegistrationToken) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Uri(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ContentDisposition(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_MimeType(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_TotalBytesToReceive(INT64*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_BytesReceived(INT64*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_EstimatedEndTime(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ResultFilePath(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_State(COREWEBVIEW2_DOWNLOAD_STATE*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_InterruptReason(int*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Cancel() = 0;
+    virtual HRESULT STDMETHODCALLTYPE Pause() = 0;
+    virtual HRESULT STDMETHODCALLTYPE Resume() = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_CanResume(BOOL*) = 0;
+};
+
+MIDL_INTERFACE("e99bbe21-43e9-4544-a732-282764eafa60")
+ICoreWebView2DownloadStartingEventArgs : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE get_DownloadOperation(ICoreWebView2DownloadOperation**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Cancel(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_Cancel(BOOL) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_ResultFilePath(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_ResultFilePath(LPCWSTR) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Handled(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_Handled(BOOL) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDeferral(ICoreWebView2Deferral**) = 0;
+};
+
+MIDL_INTERFACE("efedc989-c396-41ca-83f7-07f845a55724")
+ICoreWebView2DownloadStartingEventHandler : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs*) = 0;
+};
+
+MIDL_INTERFACE("9e8f0cf8-e670-4b5e-b2bc-73e061e3184c")
+ICoreWebView2_2 : public ICoreWebView2
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE add_WebResourceResponseReceived(void*, EventRegistrationToken*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_WebResourceResponseReceived(EventRegistrationToken) = 0;
+    virtual HRESULT STDMETHODCALLTYPE NavigateWithWebResourceRequest(ICoreWebView2WebResourceRequest*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE add_DOMContentLoaded(void*, EventRegistrationToken*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_DOMContentLoaded(EventRegistrationToken) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_CookieManager(void**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Environment(ICoreWebView2Environment**) = 0;
+};
+
+MIDL_INTERFACE("a0d6df20-3b92-416d-aa0c-437a9c727857")
+ICoreWebView2_3 : public ICoreWebView2_2
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE TrySuspend(void*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Resume() = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IsSuspended(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetVirtualHostNameToFolderMapping(LPCWSTR, LPCWSTR, int) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ClearVirtualHostNameToFolderMapping(LPCWSTR) = 0;
+};
+
+MIDL_INTERFACE("20d02d59-6df2-42dc-bd06-f98a694b1302")
+ICoreWebView2_4 : public ICoreWebView2_3
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE add_FrameCreated(void*, EventRegistrationToken*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_FrameCreated(EventRegistrationToken) = 0;
+    virtual HRESULT STDMETHODCALLTYPE add_DownloadStarting(ICoreWebView2DownloadStartingEventHandler*, EventRegistrationToken*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE remove_DownloadStarting(EventRegistrationToken) = 0;
+
+    static IID getIID()     { return { 0x20d02d59, 0x6df2, 0x42dc, { 0xbd, 0x06, 0xf9, 0x8a, 0x69, 0x4b, 0x13, 0x02 } }; }
 };
 
 MIDL_INTERFACE("4d00c0d1-9434-4eb6-8078-8697a560334f")
@@ -1671,10 +1997,105 @@ private:
     }
 
     //==============================================================================
+    /// Fetches one of the WebView2 LPWSTR out-params, and frees it.
+    template <typename GetStringFn>
+    static std::string getCoTaskString (GetStringFn&& getString)
+    {
+        LPWSTR raw = {};
+
+        if (getString (std::addressof (raw)) != S_OK || raw == nullptr)
+            return {};
+
+        auto result = createUTF8FromUTF16 (std::wstring (raw));
+        CoTaskMemFree (raw);
+        return result;
+    }
+
+    HRESULT onDownloadStarting (ICoreWebView2DownloadStartingEventArgs* args)
+    {
+        // Take over the download completely, so WebView2 doesn't show its own
+        // download UI on top of ours.
+        args->put_Handled (TRUE);
+
+        COMPtr<ICoreWebView2DownloadOperation> download;
+
+        if (args->get_DownloadOperation (download.getAddress()) != S_OK || download == nullptr)
+            return E_FAIL;
+
+        Options::DownloadRequest request;
+        request.url = getCoTaskString ([&] (LPWSTR* s) { return download->get_Uri (s); });
+        request.mimeType = getCoTaskString ([&] (LPWSTR* s) { return download->get_MimeType (s); });
+
+        // WebView2 has already chosen a default full path for this download, and the
+        // filename part of it is the name the page asked for.
+        auto defaultPath = getCoTaskString ([&] (LPWSTR* s) { return args->get_ResultFilePath (s); });
+
+        if (auto lastSlash = defaultPath.find_last_of ("\\/"); lastSlash != std::string::npos)
+            request.suggestedFilename = defaultPath.substr (lastSlash + 1);
+        else
+            request.suggestedFilename = defaultPath;
+
+        auto path = options.chooseDownloadDestination ? options.chooseDownloadDestination (request)
+                                                      : showSaveDialog (request.suggestedFilename);
+
+        if (path.empty())
+        {
+            args->put_Cancel (TRUE);
+            return S_OK;
+        }
+
+        args->put_ResultFilePath (createUTF16StringFromUTF8 (path).c_str());
+
+        if (options.onDownloadCompleted)
+        {
+            auto* stateHandler = new DownloadStateHandler (*this);
+            stateHandler->AddRef();
+
+            if (download->add_StateChanged (stateHandler, std::addressof (stateHandler->token)) != S_OK)
+                stateHandler->Release();
+        }
+
+        return S_OK;
+    }
+
+    /// The default destination chooser: a stock Save dialog seeded with the suggested name.
+    std::string showSaveDialog (const std::string& suggestedFilename)
+    {
+        COMPtr<IFileSaveDialog> dialog;
+
+        if (CoCreateInstance (CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_IFileSaveDialog, (void**) dialog.getAddress()) != S_OK
+             || dialog == nullptr)
+            return {};
+
+        if (! suggestedFilename.empty())
+            dialog->SetFileName (createUTF16StringFromUTF8 (suggestedFilename).c_str());
+
+        // Show() returns HRESULT_FROM_WIN32 (ERROR_CANCELLED) if the user backs out.
+        if (dialog->Show (hwnd) != S_OK)
+            return {};
+
+        COMPtr<IShellItem> item;
+
+        if (dialog->GetResult (item.getAddress()) != S_OK || item == nullptr)
+            return {};
+
+        LPWSTR raw = {};
+
+        if (item->GetDisplayName (SIGDN_FILESYSPATH, std::addressof (raw)) != S_OK || raw == nullptr)
+            return {};
+
+        auto result = createUTF8FromUTF16 (std::wstring (raw));
+        CoTaskMemFree (raw);
+        return result;
+    }
+
+    //==============================================================================
     struct EventHandler  : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                            public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
                            public ICoreWebView2WebMessageReceivedEventHandler,
                            public ICoreWebView2PermissionRequestedEventHandler,
+                           public ICoreWebView2DownloadStartingEventHandler,
                            public ICoreWebView2WebResourceRequestedEventHandler
     {
         EventHandler (Pimpl& p) : ownerPimpl (p), deletionCheckerRef (p.deletionChecker) {}
@@ -1714,6 +2135,17 @@ private:
             EventRegistrationToken token;
             view->add_WebMessageReceived (this, std::addressof (token));
             view->add_PermissionRequested (this, std::addressof (token));
+
+            // DownloadStarting needs ICoreWebView2_4 (Edge runtime 92+). On anything older
+            // we just leave downloads doing whatever WebView2 does by default.
+            {
+                COMPtr<ICoreWebView2_4> view4;
+
+                if (view->QueryInterface (ICoreWebView2_4::getIID(), (void**) view4.getAddress()) == S_OK
+                     && view4 != nullptr)
+                    view4->add_DownloadStarting (this, std::addressof (token));
+            }
+
             ownerPimpl.webviewControllerCreationComplete (controller, view);
             return S_OK;
         }
@@ -1742,6 +2174,14 @@ private:
             return S_OK;
         }
 
+        HRESULT STDMETHODCALLTYPE Invoke (ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) override
+        {
+            if (deletionCheckerRef->deleted)
+                return E_FAIL;
+
+            return ownerPimpl.onDownloadStarting (args);
+        }
+
         HRESULT STDMETHODCALLTYPE Invoke (ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) override
         {
             if (deletionCheckerRef->deleted)
@@ -1751,6 +2191,45 @@ private:
         }
 
         Pimpl& ownerPimpl;
+        std::atomic<ULONG> refCount { 0 };
+        std::shared_ptr<DeletionChecker> deletionCheckerRef;
+    };
+
+    //==============================================================================
+    /// Watches a single download to completion. One of these is created per download,
+    /// and it deletes itself once the download reaches a terminal state.
+    struct DownloadStateHandler  : public ICoreWebView2StateChangedEventHandler
+    {
+        DownloadStateHandler (Pimpl& p) : ownerPimpl (p), deletionCheckerRef (p.deletionChecker) {}
+        DownloadStateHandler (const DownloadStateHandler&) = delete;
+        DownloadStateHandler& operator= (const DownloadStateHandler&) = delete;
+        virtual ~DownloadStateHandler() {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface (REFIID, LPVOID*) override   { return E_NOINTERFACE; }
+        ULONG STDMETHODCALLTYPE AddRef() override     { return ++refCount; }
+        ULONG STDMETHODCALLTYPE Release() override    { auto newCount = --refCount; if (newCount == 0) delete this; return newCount; }
+
+        HRESULT STDMETHODCALLTYPE Invoke (ICoreWebView2DownloadOperation* download, IUnknown*) override
+        {
+            COREWEBVIEW2_DOWNLOAD_STATE state = {};
+            download->get_State (std::addressof (state));
+
+            if (state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS)
+                return S_OK;
+
+            if (! deletionCheckerRef->deleted && ownerPimpl.options.onDownloadCompleted)
+                ownerPimpl.options.onDownloadCompleted (getCoTaskString ([&] (LPWSTR* s) { return download->get_ResultFilePath (s); }),
+                                                        state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED);
+
+            // This drops the reference the event registration took, and then our own,
+            // which deletes us - so nothing may touch a member after this point.
+            download->remove_StateChanged (token);
+            Release();
+            return S_OK;
+        }
+
+        Pimpl& ownerPimpl;
+        EventRegistrationToken token = {};
         std::atomic<ULONG> refCount { 0 };
         std::shared_ptr<DeletionChecker> deletionCheckerRef;
     };
