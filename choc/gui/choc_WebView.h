@@ -138,6 +138,14 @@ public:
         /// need to.
         bool enableDefaultClipboardKeyShortcutsInSafari = true;
 
+        /// When true, the webview denies the browser permission requests that
+        /// would otherwise show the user a prompt (e.g. Web MIDI, microphone,
+        /// camera, geolocation). Clipboard read is left allowed — it never
+        /// prompts and web apps rely on it for paste. Useful for self-contained
+        /// UIs (such as plugin editors) that must not pop a system permission
+        /// prompt. Currently honoured by the Windows (WebView2) backend.
+        bool denyPermissionRequests = false;
+
         /// Describes a download which the page has started, e.g. by clicking a link
         /// with a `download` attribute, or navigating to a resource the browser can't
         /// display itself.
@@ -168,6 +176,43 @@ public:
         /// it succeeded. This isn't called for downloads which were cancelled.
         /// (Currently honoured by the macOS and Windows backends)
         std::function<void(const std::string& localPath, bool succeeded)> onDownloadCompleted;
+
+        /// What should happen when the page tries to go to a URL. See handleNavigation.
+        enum class NavigationAction
+        {
+            allow,                  ///< let this view navigate to the URL
+            block,                  ///< do nothing at all
+            openInDefaultBrowser    ///< hand the URL to the OS and stay where we are
+        };
+
+        /// Decides what happens when the page navigates to a URL, or asks for one to be
+        /// opened in a new window (a link with target="_blank", or window.open()).
+        /// `isNewWindowRequest` distinguishes the two.
+        ///
+        /// When this isn't set, the view navigates to URLs itself, and new-window
+        /// requests are opened in the default browser - a WebView has no second window
+        /// to put them in, so the alternative is that they silently do nothing.
+        ///
+        /// For the common "this view is an application's UI, not a browser" case, set
+        /// openExternalLinksInBrowser instead of writing this by hand.
+        /// (Currently honoured by the macOS and Windows backends)
+        std::function<NavigationAction(const std::string& url, bool isNewWindowRequest)> handleNavigation;
+
+        /// When true, a user clicking a link to a http/https URL somewhere other than the
+        /// page the view is currently showing opens it in the default browser, rather than
+        /// letting it replace the content. Use this for UIs which must never navigate away
+        /// from themselves, such as a plugin editor, where doing so would leave the user
+        /// staring at a web page with no way back.
+        ///
+        /// This only applies to navigations the user causes. The initial content load and
+        /// any navigate() call the host makes are always allowed.
+        ///
+        /// Leave this false for views which are supposed to browse. Either way,
+        /// new-window requests still go to the default browser.
+        ///
+        /// Ignored if handleNavigation is set.
+        /// (Currently honoured by the macOS and Windows backends)
+        bool openExternalLinksInBrowser = false;
     };
 
     /// Creates a WebView with default options.
@@ -238,6 +283,60 @@ private:
     struct DeletionChecker { bool deleted = false; };
 };
 
+
+//==============================================================================
+/// The scheme + host + port of a URL, e.g. "https://foo.com:8080/bar?x" -> "https://foo.com:8080".
+/// Anything without a "//" (e.g. "about:blank", "data:...") has no origin, and returns empty.
+inline std::string getURLOrigin (std::string_view url)
+{
+    auto schemeEnd = url.find ("//");
+
+    if (schemeEnd == std::string_view::npos)
+        return {};
+
+    auto authorityEnd = url.find ('/', schemeEnd + 2);
+
+    return std::string (authorityEnd == std::string_view::npos ? url
+                                                               : url.substr (0, authorityEnd));
+}
+
+/// Works out what to do with a navigation. Shared by the platform backends so they all
+/// behave the same way.
+///
+/// `isUserInitiated` must be true only for navigations the page's user caused, such as
+/// clicking a link or submitting a form. Navigations the host asked for - the initial
+/// content load, and any call to navigate() - are not user-initiated, and are always
+/// allowed: the Windows backend serves its own UI from https://choc.localhost/, so
+/// treating its own first load as an "external" web URL would open the app's interface
+/// in the user's browser.
+inline WebView::Options::NavigationAction decideNavigationAction (const WebView::Options& options,
+                                                                  const std::string& url,
+                                                                  bool isNewWindowRequest,
+                                                                  bool isUserInitiated,
+                                                                  const std::string& currentURL)
+{
+    using Action = WebView::Options::NavigationAction;
+
+    if (options.handleNavigation)
+        return options.handleNavigation (url, isNewWindowRequest);
+
+    // A WebView has no second window to open these in, so the choice is the default
+    // browser or nothing happening at all.
+    if (isNewWindowRequest)
+        return Action::openInDefaultBrowser;
+
+    if (options.openExternalLinksInBrowser && isUserInitiated)
+    {
+        // Only web URLs are candidates - the custom fetchResource scheme, blob:, data:,
+        // about:blank etc. are the view showing its own content, and must be left alone.
+        auto isWebURL = url.rfind ("http://", 0) == 0 || url.rfind ("https://", 0) == 0;
+
+        if (isWebURL && getURLOrigin (url) != getURLOrigin (currentURL))
+            return Action::openInDefaultBrowser;
+    }
+
+    return Action::allow;
+}
 
 #ifdef JUCE_GUI_EXTRA_H_INCLUDED
 // This function will create a JUCE Component that contains and manages the given WebView.
@@ -872,6 +971,70 @@ private:
         return objc_getClass ("WKDownload") != nullptr;
     }
 
+    static void openInDefaultBrowser (const std::string& url)
+    {
+        CHOC_AUTORELEASE_BEGIN
+
+        if (id nsURL = objc::callClass<id> ("NSURL", "URLWithString:", objc::getNSString (url)))
+            objc::call<BOOL> (objc::callClass<id> ("NSWorkspace", "sharedWorkspace"), "openURL:", nsURL);
+
+        CHOC_AUTORELEASE_END
+    }
+
+    /// The URL this view is currently showing, used to tell an external link from one
+    /// which is part of the page's own content.
+    std::string getCurrentURL() const
+    {
+        CHOC_AUTORELEASE_BEGIN
+
+        if (id url = objc::call<id> (webview, "URL"))
+            return objc::getString (objc::call<id> (url, "absoluteString"));
+
+        CHOC_AUTORELEASE_END
+        return defaultURI;
+    }
+
+    /// Applies the decision for a navigation, and returns true if the caller should let
+    /// it proceed.
+    bool shouldAllowNavigation (const std::string& url, bool isNewWindowRequest, bool isUserInitiated)
+    {
+        switch (decideNavigationAction (*options, url, isNewWindowRequest, isUserInitiated, getCurrentURL()))
+        {
+            case Options::NavigationAction::openInDefaultBrowser:  openInDefaultBrowser (url); return false;
+            case Options::NavigationAction::block:                 return false;
+            case Options::NavigationAction::allow:                 break;
+        }
+
+        return true;
+    }
+
+    /// True for the navigation types the user causes directly - clicking a link or
+    /// submitting a form. A loadRequest: from the host code reports "other" (-1).
+    static bool isUserInitiatedNavigation (id action)
+    {
+        switch (objc::call<long> (action, "navigationType"))
+        {
+            case WKNavigationTypeLinkActivated:
+            case WKNavigationTypeFormSubmitted:
+            case WKNavigationTypeFormResubmitted:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static std::string getURLFromNavigationAction (id action)
+    {
+        CHOC_AUTORELEASE_BEGIN
+
+        if (id request = objc::call<id> (action, "request"))
+            if (id url = objc::call<id> (request, "URL"))
+                return objc::getString (objc::call<id> (url, "absoluteString"));
+
+        CHOC_AUTORELEASE_END
+        return {};
+    }
+
     /// Called by the WKDownloadDelegate method to find out where a download should go.
     /// The completion handler must be invoked exactly once - with nil to cancel.
     void chooseDownloadDestination (id download, id response, id suggestedFilename, void (^completionHandler)(id))
@@ -1100,15 +1263,57 @@ private:
             // that isn't a download has to be allowed through.
 
             class_addMethod (delegateClass, sel_registerName ("webView:decidePolicyForNavigationAction:decisionHandler:"),
-                             (IMP) (+[](id, SEL, id, id action, void (^decisionHandler)(long))
+                             (IMP) (+[](id self, SEL, id, id action, void (^decisionHandler)(long))
                              {
                                  if (canPerformDownloads()
                                        && objc::call<BOOL> (action, "respondsToSelector:", sel_registerName ("shouldPerformDownload"))
                                        && objc::call<BOOL> (action, "shouldPerformDownload"))
+                                 {
                                      decisionHandler (WKNavigationActionPolicyDownload);
-                                 else
+                                     return;
+                                 }
+
+                                 // A nil targetFrame means the page wants a new window: allow it through
+                                 // so WebKit goes on to ask for one, which is where that case is handled.
+                                 if (objc::call<id> (action, "targetFrame") == nullptr)
+                                 {
                                      decisionHandler (WKNavigationActionPolicyAllow);
+                                     return;
+                                 }
+
+                                 auto p = getPimpl (self);
+
+                                 if (p == nullptr || p->shouldAllowNavigation (getURLFromNavigationAction (action), false,
+                                                                               isUserInitiatedNavigation (action)))
+                                     decisionHandler (WKNavigationActionPolicyAllow);
+                                 else
+                                     decisionHandler (WKNavigationActionPolicyCancel);
                              }), "v@:@@@");
+
+            // Without this, WebKit has nowhere to put a link with target="_blank" or a
+            // window.open() call, and silently does nothing at all.
+            class_addMethod (delegateClass, sel_registerName ("webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:"),
+                             (IMP) (+[](id self, SEL, id, id, id action, id) -> id
+                             {
+                                 if (auto p = getPimpl (self))
+                                 {
+                                     if (auto url = getURLFromNavigationAction (action); ! url.empty())
+                                     {
+                                         // NB: decide once - a second call would run the client's
+                                         // handleNavigation twice for a single click.
+                                         switch (decideNavigationAction (*p->options, url, true, true, p->getCurrentURL()))
+                                         {
+                                             // "allow" for a new-window request means loading it here,
+                                             // since this is the only window there is.
+                                             case Options::NavigationAction::allow:                 p->navigate (url); break;
+                                             case Options::NavigationAction::openInDefaultBrowser:  openInDefaultBrowser (url); break;
+                                             case Options::NavigationAction::block:                 break;
+                                         }
+                                     }
+                                 }
+
+                                 return nil;   // never give WebKit a second view to load into
+                             }), "@@:@@@@");
 
             // NB: WebKit can't turn a response served by a WKURLSchemeHandler into a WKDownload,
             // so when fetchResource is being used, this path never produces a download. Links with
@@ -1170,7 +1375,12 @@ private:
 
     static constexpr long WKUserScriptInjectionTimeAtDocumentStart = 0;
 
-    static constexpr long WKNavigationActionPolicyAllow = 1,
+    static constexpr long WKNavigationTypeLinkActivated = 0,
+                          WKNavigationTypeFormSubmitted = 1,
+                          WKNavigationTypeFormResubmitted = 4;
+
+    static constexpr long WKNavigationActionPolicyCancel = 0,
+                          WKNavigationActionPolicyAllow = 1,
                           WKNavigationActionPolicyDownload = 2,
                           WKNavigationResponsePolicyAllow = 1,
                           WKNavigationResponsePolicyDownload = 2;
@@ -1213,6 +1423,7 @@ private:
 #include <atomic>
 #include <shlobj.h>
 #include <shobjidl.h>   // for IFileSaveDialog, used as the default download destination chooser
+#include <shellapi.h>   // for ShellExecuteW, used to open links in the default browser
 #include <rpc.h>
 #include <rpcndr.h>
 #include <objidl.h>
@@ -1447,6 +1658,52 @@ public:
     virtual HRESULT STDMETHODCALLTYPE RemoveWebResourceRequestedFilter(const LPCWSTR, const COREWEBVIEW2_WEB_RESOURCE_CONTEXT) = 0;
     virtual HRESULT STDMETHODCALLTYPE add_WindowCloseRequested(void*, EventRegistrationToken*) = 0;
     virtual HRESULT STDMETHODCALLTYPE remove_WindowCloseRequested(EventRegistrationToken) = 0;
+};
+
+//==============================================================================
+// Navigation: NavigationStarting gates where this view is allowed to go, and
+// NewWindowRequested catches target="_blank" / window.open(), which would otherwise
+// do nothing at all.
+
+MIDL_INTERFACE("5b495469-e119-438a-9b18-7604f25f2e49")
+ICoreWebView2NavigationStartingEventArgs : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE get_Uri(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IsUserInitiated(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IsRedirected(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_RequestHeaders(void**) = 0;   // ICoreWebView2HttpRequestHeaders, declared below
+    virtual HRESULT STDMETHODCALLTYPE get_Cancel(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_Cancel(BOOL) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_NavigationId(UINT64*) = 0;
+};
+
+MIDL_INTERFACE("9adbe429-f36d-432b-9ddc-f8881fbd76e3")
+ICoreWebView2NavigationStartingEventHandler : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs*) = 0;
+};
+
+MIDL_INTERFACE("34acb11c-fc37-4418-9132-f9c21d1eafb9")
+ICoreWebView2NewWindowRequestedEventArgs : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE get_Uri(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_NewWindow(ICoreWebView2*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_NewWindow(ICoreWebView2**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_Handled(BOOL) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_Handled(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IsUserInitiated(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDeferral(ICoreWebView2Deferral**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_WindowFeatures(void**) = 0;
+};
+
+MIDL_INTERFACE("d4c185fe-c81c-4989-97af-2d3fa7ab5651")
+ICoreWebView2NewWindowRequestedEventHandler : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs*) = 0;
 };
 
 //==============================================================================
@@ -2011,6 +2268,73 @@ private:
         return result;
     }
 
+    static void openInDefaultBrowser (const std::string& url)
+    {
+        auto wide = createUTF16StringFromUTF8 (url);
+        ShellExecuteW (nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    /// The URL this view is currently showing, used to tell an external link from one
+    /// which is part of the page's own content.
+    std::string getCurrentURL()
+    {
+        if (coreWebView == nullptr)
+            return defaultURI;
+
+        auto url = getCoTaskString ([&] (LPWSTR* s) { return coreWebView->get_Source (s); });
+        return url.empty() ? defaultURI : url;
+    }
+
+    HRESULT onNavigationStarting (ICoreWebView2NavigationStartingEventArgs* args)
+    {
+        auto url = getCoTaskString ([&] (LPWSTR* s) { return args->get_Uri (s); });
+
+        // The initial content load and any Navigate() the host makes report false here,
+        // which keeps them out of the openExternalLinksInBrowser test - this view serves
+        // its own UI from an https:// URL, so it would otherwise send it to the browser.
+        BOOL userInitiated = FALSE;
+        args->get_IsUserInitiated (std::addressof (userInitiated));
+
+        switch (decideNavigationAction (options, url, false, userInitiated != FALSE, getCurrentURL()))
+        {
+            case Options::NavigationAction::openInDefaultBrowser:
+                openInDefaultBrowser (url);
+                args->put_Cancel (TRUE);
+                break;
+
+            case Options::NavigationAction::block:
+                args->put_Cancel (TRUE);
+                break;
+
+            case Options::NavigationAction::allow:
+                break;
+        }
+
+        return S_OK;
+    }
+
+    /// target="_blank" and window.open(). Without handling this, WebView2 opens a bare
+    /// popup window; with put_Handled it does nothing, so we have to place the URL.
+    HRESULT onNewWindowRequested (ICoreWebView2NewWindowRequestedEventArgs* args)
+    {
+        args->put_Handled (TRUE);
+
+        auto url = getCoTaskString ([&] (LPWSTR* s) { return args->get_Uri (s); });
+
+        if (! url.empty())
+        {
+            switch (decideNavigationAction (options, url, true, true, getCurrentURL()))
+            {
+                // "allow" means loading it here, since this is the only window there is.
+                case Options::NavigationAction::allow:                 navigate (url); break;
+                case Options::NavigationAction::openInDefaultBrowser:  openInDefaultBrowser (url); break;
+                case Options::NavigationAction::block:                 break;
+            }
+        }
+
+        return S_OK;
+    }
+
     HRESULT onDownloadStarting (ICoreWebView2DownloadStartingEventArgs* args)
     {
         // Take over the download completely, so WebView2 doesn't show its own
@@ -2096,6 +2420,8 @@ private:
                            public ICoreWebView2WebMessageReceivedEventHandler,
                            public ICoreWebView2PermissionRequestedEventHandler,
                            public ICoreWebView2DownloadStartingEventHandler,
+                           public ICoreWebView2NavigationStartingEventHandler,
+                           public ICoreWebView2NewWindowRequestedEventHandler,
                            public ICoreWebView2WebResourceRequestedEventHandler
     {
         EventHandler (Pimpl& p) : ownerPimpl (p), deletionCheckerRef (p.deletionChecker) {}
@@ -2136,6 +2462,11 @@ private:
             view->add_WebMessageReceived (this, std::addressof (token));
             view->add_PermissionRequested (this, std::addressof (token));
 
+            // NB: these two take void*, so the pointer has to be adjusted to the right
+            // base explicitly - handing them a bare `this` would pass the wrong vtable.
+            view->add_NavigationStarting (static_cast<ICoreWebView2NavigationStartingEventHandler*> (this), std::addressof (token));
+            view->add_NewWindowRequested (static_cast<ICoreWebView2NewWindowRequestedEventHandler*> (this), std::addressof (token));
+
             // DownloadStarting needs ICoreWebView2_4 (Edge runtime 92+). On anything older
             // we just leave downloads doing whatever WebView2 does by default.
             {
@@ -2168,8 +2499,15 @@ private:
             COREWEBVIEW2_PERMISSION_KIND permissionKind;
             args->get_PermissionKind (std::addressof (permissionKind));
 
+            // Setting a non-DEFAULT state suppresses WebView2's permission prompt.
+            // Clipboard read is auto-allowed (it never prompts and web apps rely
+            // on it for paste), so allow it even when denyPermissionRequests is
+            // set; that flag targets the prompt-triggering device permissions
+            // (Web MIDI, microphone, camera, geolocation, …).
             if (permissionKind == COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ)
                 args->put_State (COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+            else if (ownerPimpl.options.denyPermissionRequests)
+                args->put_State (COREWEBVIEW2_PERMISSION_STATE_DENY);
 
             return S_OK;
         }
@@ -2180,6 +2518,22 @@ private:
                 return E_FAIL;
 
             return ownerPimpl.onDownloadStarting (args);
+        }
+
+        HRESULT STDMETHODCALLTYPE Invoke (ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) override
+        {
+            if (deletionCheckerRef->deleted)
+                return E_FAIL;
+
+            return ownerPimpl.onNavigationStarting (args);
+        }
+
+        HRESULT STDMETHODCALLTYPE Invoke (ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) override
+        {
+            if (deletionCheckerRef->deleted)
+                return E_FAIL;
+
+            return ownerPimpl.onNewWindowRequested (args);
         }
 
         HRESULT STDMETHODCALLTYPE Invoke (ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) override
