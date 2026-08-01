@@ -271,6 +271,22 @@ public:
     /// Returns a platform-specific handle for this view
     void* getViewHandle() const;
 
+    /// Moves this view into a different parent window.
+    ///
+    /// Use this rather than reparenting getViewHandle() yourself. On Windows the
+    /// underlying WebView2 keeps hosting state tied to the window its controller
+    /// was created under, and a plain SetParent() leaves that state behind: the
+    /// view's window is visible, correctly parented and correctly sized, and
+    /// paints nothing at all, permanently. This performs the move and tells the
+    /// browser about it.
+    ///
+    /// newParentWindow is an HWND on Windows, an NSView* on macOS, and a GTK
+    /// container widget on Linux. Passing nullptr detaches the view without
+    /// destroying it, so it can be given a new parent later.
+    ///
+    /// Returns false if the view isn't in a state where it can be moved.
+    bool setParentWindow (void* newParentWindow);
+
 private:
     //==============================================================================
     struct Pimpl;
@@ -504,6 +520,28 @@ struct choc::ui::WebView::Pimpl
 
     std::shared_ptr<DeletionChecker> deletionChecker { std::make_shared<DeletionChecker>() };
 
+    bool setParentWindow (void* newParent)
+    {
+        if (webview == nullptr)
+            return false;
+
+        // g_object_ref_sink() has already given us a reference, so the extra ref
+        // here is only to survive the gap between the two container calls.
+        g_object_ref (G_OBJECT (webview));
+
+        if (auto* currentParent = gtk_widget_get_parent (GTK_WIDGET (webview)))
+            gtk_container_remove (GTK_CONTAINER (currentParent), GTK_WIDGET (webview));
+
+        if (newParent != nullptr)
+        {
+            gtk_container_add (GTK_CONTAINER (newParent), GTK_WIDGET (webview));
+            gtk_widget_show_all (GTK_WIDGET (newParent));
+        }
+
+        g_object_unref (G_OBJECT (webview));
+        return true;
+    }
+
     bool evaluateJavascript (const std::string& js, CompletionHandler&& completionHandler)
     {
         GAsyncReadyCallback callback = {};
@@ -725,6 +763,29 @@ struct choc::ui::WebView::Pimpl
     void* getViewHandle() const     { return (CHOC_OBJC_CAST_BRIDGED void*) webview; }
 
     std::shared_ptr<DeletionChecker> deletionChecker { std::make_shared<DeletionChecker>() };
+
+    bool setParentWindow (void* newParent)
+    {
+        if (webview == nullptr)
+            return false;
+
+        CHOC_AUTORELEASE_BEGIN
+
+        // A WKWebView is just an NSView, and AppKit keeps its layer hosting with
+        // it across a move, so there is nothing to re-establish here - unlike
+        // the Windows backend.
+        objc::call<void> (webview, "removeFromSuperview");
+
+        if (auto parent = (CHOC_OBJC_CAST_BRIDGED id) newParent)
+        {
+            objc::call<void> (webview, "setFrame:", objc::call<objc::CGRect> (parent, "bounds"));
+            objc::call<void> (webview, "setAutoresizingMask:", 18 /* NSViewWidthSizable | NSViewHeightSizable */);
+            objc::call<void> (parent, "addSubview:", webview);
+        }
+
+        CHOC_AUTORELEASE_END
+        return true;
+    }
 
     bool addInitScript (const std::string& script)
     {
@@ -2002,6 +2063,63 @@ struct WebView::Pimpl
         return coreWebView->Navigate (createUTF16StringFromUTF8 (url).c_str()) == S_OK;
     }
 
+    bool setParentWindow (void* newParent)
+    {
+        if (hwnd.hwnd == nullptr)
+            return false;
+
+        auto parent = (HWND) newParent;
+
+        // Hide before moving, so a detached view doesn't flash on screen as a
+        // stray popup, and so the style change below can't be seen mid-flight.
+        ShowWindow (hwnd.hwnd, SW_HIDE);
+
+        // A window with WS_CHILD and no parent is invalid, so the style has to
+        // go back to WS_POPUP before the parent is cleared.
+        if (parent == nullptr)
+        {
+            SetWindowLongPtr (hwnd.hwnd, GWL_STYLE, WS_POPUP);
+            SetParent (hwnd.hwnd, nullptr);
+        }
+        else
+        {
+            SetParent (hwnd.hwnd, parent);
+
+            // WS_CHILD *without* WS_VISIBLE, deliberately. Putting WS_VISIBLE in
+            // the style here would mark the window visible without showing it,
+            // and the ShowWindow() below would then find nothing to do and send
+            // no WM_SHOWWINDOW - which is the message that drives put_IsVisible
+            // in our window proc. The browser would stay switched off and the
+            // view would paint nothing, with every window property looking
+            // perfectly healthy.
+            SetWindowLongPtr (hwnd.hwnd, GWL_STYLE, WS_CHILD);
+        }
+
+        if (coreWebViewController)
+        {
+            // Tell the browser its host window moved. put_ParentWindow is the
+            // documented way to re-establish the controller's hosting, and
+            // NotifyParentWindowPositionChanged updates the input and
+            // accessibility mapping that would otherwise still point at the
+            // window we came from.
+            coreWebViewController->put_ParentWindow (hwnd.hwnd);
+            coreWebViewController->NotifyParentWindowPositionChanged();
+        }
+
+        if (parent != nullptr)
+        {
+            ShowWindow (hwnd.hwnd, SW_SHOW);
+            resizeContentToFit();
+
+            // Belt and braces: don't leave the browser's visibility depending on
+            // a window message arriving. This is the single thing that decides
+            // whether the view paints at all.
+            setVisible (true);
+        }
+
+        return true;
+    }
+
     bool addInitScript (const std::string& script)
     {
         if (! coreWebView)
@@ -2726,6 +2844,7 @@ inline bool WebView::evaluateJavascript (const std::string& script, CompletionHa
 }
 
 inline void* WebView::getViewHandle() const                          { return pimpl != nullptr ? pimpl->getViewHandle() : nullptr; }
+inline bool WebView::setParentWindow (void* newParentWindow)         { return pimpl != nullptr && pimpl->setParentWindow (newParentWindow); }
 
 inline bool WebView::bind (const std::string& functionName, CallbackFn&& fn)
 {
