@@ -1997,6 +1997,15 @@ public:
     virtual HRESULT STDMETHODCALLTYPE Invoke (HRESULT, LPCWSTR) = 0;
 };
 
+// Completion callback for AddScriptToExecuteOnDocumentCreated. Passed as void*
+// and never QueryInterface'd by IID, so only the vtable layout matters here.
+MIDL_INTERFACE("b99369f3-9b11-47b5-bc6f-8e7895fcea17")
+ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE Invoke (HRESULT, LPCWSTR) = 0;
+};
+
 }
 
 #endif // __webview2_h__
@@ -2073,8 +2082,18 @@ struct WebView::Pimpl
         if (url.empty())
             return navigate (defaultURI);
 
+        // WebView2 reports navigations issued through the Navigate() API as
+        // user-initiated in NavigationStarting. Remember the URL so
+        // onNavigationStarting can recognise this as the view loading its own
+        // content and exempt it from the external-link test — otherwise a
+        // deferred initial load (issued once about:blank has already committed)
+        // gets bounced to the user's browser.
+        hostRequestedURL = url;
+
         return coreWebView->Navigate (createUTF16StringFromUTF8 (url).c_str()) == S_OK;
     }
+
+    std::string hostRequestedURL;
 
     bool setParentWindow (void* newParent)
     {
@@ -2138,7 +2157,20 @@ struct WebView::Pimpl
         if (! coreWebView)
             return false;
 
-        return coreWebView->AddScriptToExecuteOnDocumentCreated (createUTF16StringFromUTF8 (script).c_str(), nullptr) == S_OK;
+        // The registration completes asynchronously in the browser process, and a
+        // navigation issued before the completion callback has fired is not
+        // guaranteed to see the script. Count pending registrations so
+        // webviewControllerCreationComplete can hold the initial navigation back
+        // until every script added during webviewIsReady is confirmed in place.
+        COMPtr<AddScriptCompletedCallback> callback (new AddScriptCompletedCallback (*this));
+        ++pendingInitScriptRegistrations;
+
+        if (coreWebView->AddScriptToExecuteOnDocumentCreated (createUTF16StringFromUTF8 (script).c_str(),
+                                                              static_cast<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler*> (callback)) == S_OK)
+            return true;
+
+        --pendingInitScriptRegistrations;
+        return false;
     }
 
     bool evaluateJavascript (const std::string& script, CompletionHandler&& ch)
@@ -2215,18 +2247,41 @@ private:
 
         resizeContentToFit();
 
+        // Set before webviewIsReady so registrations made from the callback know
+        // an initial navigation is waiting on them.
+        initialNavigationPending = options.fetchResource != nullptr;
+
         if (options.webviewIsReady)
             options.webviewIsReady (owner);
 
-        // The initial navigation must be issued only after webviewIsReady has run:
-        // AddScriptToExecuteOnDocumentCreated is asynchronous, and a script
-        // registered after Navigate() has been issued isn't guaranteed to apply to
-        // that first document. Calls issued on this thread are processed in order
-        // by the browser process, so navigating last makes bind()/addInitScript()
-        // from the callback reliably visible to the first page load.
-        if (options.fetchResource)
+        // The initial navigation must not be issued until every script registered
+        // during webviewIsReady (bind()/addInitScript()) has had its
+        // AddScriptToExecuteOnDocumentCreated completion callback fire: the
+        // registration is asynchronous, and a navigation started before it
+        // completes is not guaranteed to run the script in the first document —
+        // call ordering alone is NOT sufficient. If nothing is pending, go now;
+        // otherwise the last completion callback issues the navigation
+        // (see onInitScriptRegistered).
+        if (initialNavigationPending && pendingInitScriptRegistrations == 0)
+        {
+            initialNavigationPending = false;
             navigate ({});
+        }
     }
+
+    // Called (on the UI thread) by each AddScriptCompletedCallback; issues the
+    // held-back initial navigation once the last pending registration lands.
+    void onInitScriptRegistered()
+    {
+        if (--pendingInitScriptRegistrations == 0 && initialNavigationPending)
+        {
+            initialNavigationPending = false;
+            navigate ({});
+        }
+    }
+
+    int pendingInitScriptRegistrations = 0;
+    bool initialNavigationPending = false;
 
     bool environmentCreationComplete (ICoreWebView2Environment* env)
     {
@@ -2426,9 +2481,20 @@ private:
     {
         auto url = getCoTaskString ([&] (LPWSTR* s) { return args->get_Uri (s); });
 
-        // The initial content load and any Navigate() the host makes report false here,
-        // which keeps them out of the openExternalLinksInBrowser test - this view serves
-        // its own UI from an https:// URL, so it would otherwise send it to the browser.
+        // A navigation this view itself requested through navigate() is the view
+        // loading its own content — never an external link, regardless of what
+        // IsUserInitiated claims (WebView2 reports Navigate() API calls as
+        // user-initiated). Redirects land on a different URL and fall through to
+        // the normal test below.
+        if (! hostRequestedURL.empty() && url == hostRequestedURL)
+        {
+            hostRequestedURL.clear();
+            return S_OK;
+        }
+
+        // Link clicks and form submissions report true here; navigations made by
+        // the page's own scripts report false, keeping them out of the
+        // openExternalLinksInBrowser test.
         BOOL userInitiated = FALSE;
         args->get_IsUserInitiated (std::addressof (userInitiated));
 
@@ -2723,6 +2789,41 @@ private:
         EventRegistrationToken token = {};
         std::atomic<ULONG> refCount { 0 };
         std::shared_ptr<DeletionChecker> deletionCheckerRef;
+    };
+
+    //==============================================================================
+    struct AddScriptCompletedCallback  : public ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler
+    {
+        AddScriptCompletedCallback (Pimpl& p) : ownerPimpl (p), deletionCheckerRef (p.deletionChecker) {}
+        virtual ~AddScriptCompletedCallback() {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface (REFIID refID, void** result) override
+        {
+            if (refID == IID_IUnknown)
+            {
+                *result = this;
+                AddRef();
+                return S_OK;
+            }
+
+            *result = nullptr;
+            return E_NOINTERFACE;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override     { return ++refCount; }
+        ULONG STDMETHODCALLTYPE Release() override    { auto newCount = --refCount; if (newCount == 0) delete this; return newCount; }
+
+        HRESULT STDMETHODCALLTYPE Invoke (HRESULT, LPCWSTR) override
+        {
+            if (! deletionCheckerRef->deleted)
+                ownerPimpl.onInitScriptRegistered();
+
+            return S_OK;
+        }
+
+        Pimpl& ownerPimpl;
+        std::shared_ptr<DeletionChecker> deletionCheckerRef;
+        std::atomic<ULONG> refCount { 0 };
     };
 
     //==============================================================================
