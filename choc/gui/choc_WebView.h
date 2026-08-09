@@ -91,6 +91,11 @@ public:
         /// On some platforms, this may be called synchronously during WebView
         /// construction, on others it may happen later on the message thread, so
         /// be sure to take account of this when you first use your WebView.
+        /// This callback is guaranteed to be invoked before the initial navigation
+        /// that fetchResource triggers, so it is the safe place to call bind() or
+        /// addInitScript() for functions the page expects to exist when it loads.
+        /// (On WebView2 in particular, scripts registered after the initial
+        /// navigation has been issued may miss the first document.)
         std::function<void(choc::ui::WebView&)> webviewIsReady;
 
         /// If you provide a fetchResource function, it is expected to return this
@@ -491,13 +496,18 @@ struct choc::ui::WebView::Pimpl
             };
 
             webkit_web_context_register_uri_scheme (webviewContext, getURIScheme (options).c_str(), onResourceRequested, this, nullptr);
-            navigate ({});
         }
 
         gtk_widget_show_all (webview);
 
         if (options.webviewIsReady)
             options.webviewIsReady (owner);
+
+        // Navigate only after webviewIsReady, so scripts registered from the
+        // callback via bind()/addInitScript() are in place before the first
+        // document is created.
+        if (options.fetchResource)
+            navigate ({});
 
         return true;
     }
@@ -730,13 +740,16 @@ struct choc::ui::WebView::Pimpl
 
         call<void> (config, "release");
 
-        if (options->fetchResource)
-            navigate ({});
-
         CHOC_AUTORELEASE_END
 
         if (options->webviewIsReady)
             options->webviewIsReady (owner);
+
+        // Navigate only after webviewIsReady, so scripts registered from the
+        // callback via bind()/addInitScript() are in place before the first
+        // document is created. (navigate() manages its own autorelease pool.)
+        if (options->fetchResource)
+            navigate ({});
 
         return true;
     }
@@ -2180,9 +2193,6 @@ private:
         EventRegistrationToken token;
         coreWebView->add_WebResourceRequested (eventHandler, std::addressof (token));
 
-        if (options.fetchResource)
-            navigate ({});
-
         COMPtr<ICoreWebView2Settings> settings;
 
         if (coreWebView->get_Settings (settings.getAddress()) == S_OK
@@ -2207,6 +2217,15 @@ private:
 
         if (options.webviewIsReady)
             options.webviewIsReady (owner);
+
+        // The initial navigation must be issued only after webviewIsReady has run:
+        // AddScriptToExecuteOnDocumentCreated is asynchronous, and a script
+        // registered after Navigate() has been issued isn't guaranteed to apply to
+        // that first document. Calls issued on this thread are processed in order
+        // by the browser process, so navigating last makes bind()/addInitScript()
+        // from the callback reliably visible to the first page load.
+        if (options.fetchResource)
+            navigate ({});
     }
 
     bool environmentCreationComplete (ICoreWebView2Environment* env)
