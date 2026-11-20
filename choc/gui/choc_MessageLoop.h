@@ -411,7 +411,10 @@ struct MessageWindow
             (*f)();
         }
 
-        return DefWindowProc (h, message, wParam, lParam);
+        // The window is registered and created with the ANSI APIs, so this must
+        // not be the UNICODE DefWindowProcW: that reads the ANSI window name in
+        // WM_NCCREATE as UTF-16, which can make CreateWindowA fail.
+        return DefWindowProcA (h, message, wParam, lParam);
     }
 
     static inline constexpr WPARAM magicWParam = 0xc40cc40c;
