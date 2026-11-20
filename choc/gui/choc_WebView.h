@@ -2190,7 +2190,15 @@ struct WebView::Pimpl
             return false;
 
         pageHTML = { html, "text/html" };
-        navigate (setHTMLURI);
+
+        // As with the initial navigation, this must wait for every pending
+        // init-script registration to complete, so that functions passed to
+        // bind() just before setHTML() exist in the document it loads.
+        if (pendingInitScriptRegistrations != 0)
+            htmlNavigationPending = true;
+        else
+            navigate (setHTMLURI);
+
         return true;
     }
 
@@ -2269,11 +2277,21 @@ private:
         }
     }
 
-    // Called (on the UI thread) by each AddScriptCompletedCallback; issues the
-    // held-back initial navigation once the last pending registration lands.
+    // Called (on the UI thread) by each AddScriptCompletedCallback; issues any
+    // held-back navigation once the last pending registration lands.
     void onInitScriptRegistered()
     {
-        if (--pendingInitScriptRegistrations == 0 && initialNavigationPending)
+        if (--pendingInitScriptRegistrations != 0)
+            return;
+
+        // A setHTML() call replaces whatever the initial navigation would load
+        if (htmlNavigationPending)
+        {
+            htmlNavigationPending = false;
+            initialNavigationPending = false;
+            navigate (setHTMLURI);
+        }
+        else if (initialNavigationPending)
         {
             initialNavigationPending = false;
             navigate ({});
@@ -2282,6 +2300,7 @@ private:
 
     int pendingInitScriptRegistrations = 0;
     bool initialNavigationPending = false;
+    bool htmlNavigationPending = false;
 
     bool environmentCreationComplete (ICoreWebView2Environment* env)
     {
